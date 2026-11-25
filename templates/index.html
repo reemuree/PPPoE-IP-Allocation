@@ -28,6 +28,11 @@
       <button class="nav-item" data-view="free" type="button"><span class="nav-ico" aria-hidden="true">○</span>Free IPs</button>
       <button class="nav-item" data-view="reports" type="button"><span class="nav-ico" aria-hidden="true">⚑</span>Reports</button>
       <button class="nav-item" data-view="networks" type="button"><span class="nav-ico" aria-hidden="true">⌘</span>Networks</button>
+      <button class="nav-item" data-view="live-sessions" type="button">Active PPPoE &amp; Queues</button>
+      <button class="nav-item" data-view="live-destinations" type="button">Destination Traffic</button>
+      <button class="nav-item" data-view="pppoe-monitor" type="button"><span class="nav-ico" aria-hidden="true">↻</span>Connection Monitoring</button>
+      <button class="nav-item" data-view="pppoe-events" type="button"><span class="nav-ico" aria-hidden="true">◷</span>Recent Events</button>
+      <button class="nav-item" data-view="pppoe-disconnected" type="button"><span class="nav-ico" aria-hidden="true">⊗</span>Most Disconnected</button>
     </nav>
     <div class="sidebar-foot">
       <div class="user"><span class="avatar" aria-hidden="true">{{ user[:1]|upper }}</span><span class="user-name">{{ user }}</span></div>
@@ -230,6 +235,240 @@
           <button class="btn btn-primary" id="saveNets" type="button">Save and apply</button>
           <span class="muted small" id="saveHint"></span>
         </div>
+      </section>
+
+      <!-- ===================== PPPoE Connection Monitoring ===================== -->
+      <section class="view" id="view-live-sessions" hidden>
+        <div class="toolbar">
+          <label class="search">
+            <span class="sr-only">Search username, IP, or package</span>
+            <input type="search" id="live-sessions-search" placeholder="Search username, IP, or package" autocomplete="off">
+          </label>
+          <button class="btn btn-sm" id="live-sessions-refresh" type="button">Refresh</button>
+        </div>
+        <p class="muted small" id="live-sessions-status" role="status"></p>
+        <div class="card live-graph-card">
+          <label>Bandwidth graph
+            <select id="live-graph-source"><option value="">All active interfaces</option></select>
+          </label>
+          <div class="live-graph-box"><canvas id="live-bandwidth-chart" aria-label="Live upload and download bandwidth" role="img"></canvas></div>
+          <p class="small muted">Click a username for interface history or a queue name for queue history. The graph keeps up to 60 samples while this page is open.</p>
+        </div>
+        <div class="card table-card live-table">
+          <div class="table-scroll">
+            <table class="table">
+              <thead><tr><th>Username</th><th>IP</th><th>Package / Profile</th><th>Uptime</th><th>Interface ↑ / ↓</th><th>Queue ↑ / ↓</th></tr></thead>
+              <tbody id="live-sessions-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-live-destinations" hidden>
+        <div class="toolbar">
+          <label class="search">
+            <span class="sr-only">Search client, destination IP, or ASN</span>
+            <input type="search" id="live-destinations-search" placeholder="Search client, destination IP, or ASN" autocomplete="off">
+          </label>
+          <button class="btn btn-sm" id="live-destinations-refresh" type="button">Refresh</button>
+        </div>
+        <p class="muted small" id="live-destinations-status" role="status"></p>
+        <h2>Top destination IPs</h2>
+        <div class="card table-card live-table">
+          <div class="table-scroll">
+            <table class="table">
+              <thead><tr><th>Destination IP</th><th>ASN / Organization</th><th>Upload</th><th>Download</th><th>Total rate</th></tr></thead>
+              <tbody id="live-top-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <h2>Traffic by client</h2>
+        <div class="card table-card live-table">
+          <div class="table-scroll">
+            <table class="table">
+              <thead><tr><th>Username</th><th>Client IP</th><th>Destination IP</th><th>ASN / Organization</th><th>Upload</th><th>Download</th><th>Total rate</th></tr></thead>
+              <tbody id="live-destinations-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-pppoe-monitor" hidden>
+        <div class="grid-main">
+          <article class="card stat-card">
+            <div class="stat-label">Total Events</div>
+            <div class="stat-value" id="pppoe-total-events">0</div>
+          </article>
+          <article class="card stat-card">
+            <div class="stat-label">Total Connections</div>
+            <div class="stat-value" id="pppoe-total-connected">0</div>
+          </article>
+          <article class="card stat-card">
+            <div class="stat-label">Total Disconnections</div>
+            <div class="stat-value" id="pppoe-total-disconnected">0</div>
+          </article>
+          <article class="card stat-card">
+            <div class="stat-label">Currently Connected</div>
+            <div class="stat-value" id="pppoe-currently-connected">0</div>
+          </article>
+          <article class="card stat-card">
+            <div class="stat-label">Users With Repeated Disconnects</div>
+            <div class="stat-value" id="pppoe-repeated-disconnects">0</div>
+          </article>
+        </div>
+
+        <article class="card">
+          <header class="card-head"><h2>Hourly Disconnection Trend</h2><span class="muted small">Last 24 hours</span></header>
+          <div class="chart-box"><canvas id="hourlyDisconnectChart" aria-label="Hourly disconnection trend" role="img"></canvas></div>
+        </article>
+
+        <article class="card">
+          <header class="card-head"><h2>Daily Disconnection Trend</h2><span class="muted small">Last 30 days</span></header>
+          <div class="chart-box"><canvas id="dailyDisconnectChart" aria-label="Daily disconnection trend" role="img"></canvas></div>
+        </article>
+
+        <article class="card">
+          <header class="card-head"><h2>Top 10 Most Disconnected Users</h2></header>
+          <div class="table-scroll">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>Disconnect Count</th>
+                  <th>Last Disconnect</th>
+                  <th>Last Connected</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="topDisconnectedBody"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="topDisconnectedEmpty" hidden>No disconnection data available yet.</div>
+        </article>
+      </section>
+
+      <!-- ===================== Recent PPPoE Events ===================== -->
+      <section class="view" id="view-pppoe-events" hidden>
+        <div class="toolbar">
+          <label class="search">
+            <span class="sr-only">Search username</span>
+            <input type="search" id="pppoe-search" placeholder="Search by username…" autocomplete="off">
+          </label>
+          <label class="select">
+            <span class="sr-only">Event type</span>
+            <select id="pppoe-event-filter">
+              <option value="">All events</option>
+              <option value="connected">Connected</option>
+              <option value="disconnected">Disconnected</option>
+              <option value="unknown">Unknown</option>
+            </select>
+          </label>
+          <button class="btn btn-sm" id="pppoe-events-refresh" type="button">Refresh</button>
+        </div>
+
+        <div class="card table-card">
+          <div class="table-scroll">
+            <table class="table" id="pppoeEventsTable">
+              <thead>
+                <tr>
+                  <th>Collected at</th>
+                  <th>Username</th>
+                  <th>Event</th>
+                  <th>IP Address</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody id="pppoeEventsBody"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="pppoeEventsEmpty" hidden>No events found.</div>
+          <div class="loading" id="pppoeEventsLoading" hidden><span class="spinner spinner-lg"></span> Loading…</div>
+        </div>
+      </section>
+
+      <!-- ===================== Most Disconnected Users ===================== -->
+      <section class="view" id="view-pppoe-disconnected" hidden>
+        <div class="toolbar">
+          <label class="search">
+            <span class="sr-only">Search username</span>
+            <input type="search" id="disconnected-search" placeholder="Search by username…" autocomplete="off">
+          </label>
+          <label class="select">
+            <span class="sr-only">Time range</span>
+            <select id="disconnected-days-filter">
+              <option value="">All time</option>
+              <option value="1">Today</option>
+              <option value="7">Last 7 days</option>
+              <option value="30">Last 30 days</option>
+            </select>
+          </label>
+          <button class="btn btn-sm" id="disconnected-refresh" type="button">Refresh</button>
+        </div>
+
+        <div class="card table-card">
+          <div class="table-scroll">
+            <table class="table" id="disconnectedUsersTable">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>Disconnect Count</th>
+                  <th>Last Disconnect</th>
+                  <th>Last Connected</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="disconnectedUsersBody"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="disconnectedUsersEmpty" hidden>No users found.</div>
+          <div class="loading" id="disconnectedUsersLoading" hidden><span class="spinner spinner-lg"></span> Loading…</div>
+        </div>
+      </section>
+
+      <!-- ===================== User Connection History ===================== -->
+      <section class="view" id="view-pppoe-user-history" hidden>
+        <button class="btn btn-sm" id="backToDisconnected" type="button">← Back to Most Disconnected</button>
+
+        <article class="card pad" style="margin-top: 1rem;">
+          <h2 id="historyUsername">User Connection History</h2>
+          <div class="grid-main" style="margin-top: 1rem;">
+            <div>
+              <div class="muted small">Total Connections</div>
+              <div class="stat-value" style="font-size: 2rem;" id="history-total-connected">0</div>
+            </div>
+            <div>
+              <div class="muted small">Total Disconnections</div>
+              <div class="stat-value" style="font-size: 2rem;" id="history-total-disconnected">0</div>
+            </div>
+            <div>
+              <div class="muted small">Last Connected</div>
+              <div id="history-last-connected">Never</div>
+            </div>
+            <div>
+              <div class="muted small">Last Disconnected</div>
+              <div id="history-last-disconnected">Never</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <header class="card-head"><h2>Connection Timeline</h2></header>
+          <div class="table-scroll">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Event</th>
+                  <th>IP Address</th>
+                  <th>Reason</th>
+                  <th>Raw Message</th>
+                </tr>
+              </thead>
+              <tbody id="historyEventsBody"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="historyEventsEmpty" hidden>No events found.</div>
+        </article>
       </section>
 
     </main>

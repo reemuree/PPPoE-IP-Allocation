@@ -15,6 +15,12 @@
     free: { title: 'Free IPs', section: 'view-ips', endpoint: '/api/free' },
     reports: { title: 'Reports', section: 'view-reports' },
     networks: { title: 'Networks', section: 'view-networks' },
+    'live-sessions': { title: 'Active PPPoE & Queues', section: 'view-live-sessions' },
+    'live-destinations': { title: 'Destination Traffic', section: 'view-live-destinations' },
+    'pppoe-monitor': { title: 'Connection Monitoring', section: 'view-pppoe-monitor' },
+    'pppoe-events': { title: 'Recent PPPoE Events', section: 'view-pppoe-events' },
+    'pppoe-disconnected': { title: 'Most Disconnected Users', section: 'view-pppoe-disconnected' },
+    'pppoe-user-history': { title: 'User Connection History', section: 'view-pppoe-user-history' },
   };
   const STATUS_LABEL = {
     assigned: 'Assigned', free: 'Free', reserved: 'Reserved', conflict: 'Conflict',
@@ -636,6 +642,14 @@
       if (state.netsDirty && silent) { const s = await api('/api/status'); applyStatus(s.status); return undefined; }
       return loadNetworks();
     }
+    if (v.startsWith('live-')) return loadLive(v.slice(5));
+    if (v === 'pppoe-monitor') return loadPPPoEDashboard();
+    if (v === 'pppoe-events') return loadPPPoEEvents();
+    if (v === 'pppoe-disconnected') return loadDisconnectedUsers();
+    if (v === 'pppoe-user-history') {
+      if (state.currentUsername) return showUserHistory(state.currentUsername);
+      return showView('pppoe-disconnected');
+    }
     await loadDashboard();
     if (VIEWS[v].endpoint) await loadTable();
     return undefined;
@@ -675,7 +689,11 @@
   function setAutoRefresh(on) {
     prefs.set('autoRefresh', on);
     clearInterval(timer);
-    timer = on ? setInterval(() => { if (!document.hidden) refresh({ silent: true }); }, REFRESH_MS) : null;
+    timer = on ? setInterval(() => {
+      if (!document.hidden && !state.view.startsWith('live-') && state.view !== 'pppoe-events') {
+        refresh({ silent: true });
+      }
+    }, REFRESH_MS) : null;
   }
 
   function closeMenu() {
@@ -746,9 +764,459 @@
     $('maxAddr').addEventListener('input', markDirty);
     $('saveNets').addEventListener('click', saveNetworks);
 
+    for (const mode of ['sessions', 'destinations']) {
+      $('live-' + mode + '-refresh').addEventListener('click', () => loadLive(mode));
+    }
+    $('live-sessions-search').addEventListener('input', () => {
+      if (live.sample) renderSessions(live.sample);
+    });
+    $('live-destinations-search').addEventListener('input', () => {
+      clearTimeout(live.destQuery);
+      live.destQuery = setTimeout(() => loadLive('destinations'), 300);
+    });
+    $('live-graph-source').addEventListener('change', renderGraph);
+    setInterval(() => {
+      if (!$('autoRefresh').checked || document.hidden) return;
+      if (state.view === 'live-sessions') loadLive('sessions');
+      if (state.view === 'live-destinations') loadLive('destinations');
+    }, 2000);
+    setInterval(() => {
+      if ($('autoRefresh').checked && !document.hidden && state.view === 'pppoe-events') loadPPPoEEvents(true);
+    }, 12000);
+
+    // PPPoE monitoring event listeners
+    if ($('pppoe-events-refresh')) {
+      $('pppoe-events-refresh').addEventListener('click', () => loadPPPoEEvents());
+    }
+    if ($('disconnected-refresh')) {
+      $('disconnected-refresh').addEventListener('click', () => loadDisconnectedUsers());
+    }
+    if ($('pppoe-search')) {
+      let debounce = null;
+      $('pppoe-search').addEventListener('input', () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(() => loadPPPoEEvents(), 300);
+      });
+    }
+    if ($('disconnected-search')) {
+      let debounce = null;
+      $('disconnected-search').addEventListener('input', () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(() => loadDisconnectedUsers(), 300);
+      });
+    }
+    if ($('pppoe-event-filter')) {
+      $('pppoe-event-filter').addEventListener('change', () => loadPPPoEEvents());
+    }
+    if ($('disconnected-days-filter')) {
+      $('disconnected-days-filter').addEventListener('change', () => loadDisconnectedUsers());
+    }
+    if ($('backToDisconnected')) {
+      $('backToDisconnected').addEventListener('click', () => showView('pppoe-disconnected'));
+    }
+
     updateSortArrows();
     setAutoRefresh($('autoRefresh').checked);
     showView(location.hash.slice(1) || 'dashboard');
+  }
+
+  // ------------------------------------------------------------------ PPPoE Monitoring Functions
+  let hourlyChart = null;
+  let dailyChart = null;
+
+  function formatTime(timestamp) {
+    if (!timestamp) return 'Never';
+    try {
+      return new Date(timestamp).toLocaleString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    } catch {
+      return timestamp;
+    }
+  }
+
+  function createEventBadge(eventType) {
+    const badges = {
+      connected: { text: 'Connected', class: 'badge badge-success' },
+      disconnected: { text: 'Disconnected', class: 'badge badge-danger' },
+      unknown: { text: 'Unknown', class: 'badge badge-secondary' },
+    };
+    const badge = badges[eventType] || badges.unknown;
+    return h('span', { class: badge.class, text: badge.text });
+  }
+
+  async function loadPPPoEDashboard() {
+    try {
+      const data = await api('/api/pppoe/dashboard');
+
+      // Update stats
+      $('pppoe-total-events').textContent = fmtNum(data.stats.total_events);
+      $('pppoe-total-connected').textContent = fmtNum(data.stats.total_connected);
+      $('pppoe-total-disconnected').textContent = fmtNum(data.stats.total_disconnected);
+      $('pppoe-currently-connected').textContent = fmtNum(data.stats.currently_connected);
+      $('pppoe-repeated-disconnects').textContent = fmtNum(data.stats.repeated_disconnects);
+
+      // Render hourly chart
+      const hourlyLabels = data.hourly_disconnects.map(d => {
+        const date = new Date(d.hour);
+        return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      });
+      const hourlyData = data.hourly_disconnects.map(d => d.disconnect_count);
+
+      if (typeof Chart !== 'undefined') {
+        if (hourlyChart) {
+          hourlyChart.data.labels = hourlyLabels;
+          hourlyChart.data.datasets[0].data = hourlyData;
+          hourlyChart.update();
+        } else {
+          hourlyChart = new Chart($('hourlyDisconnectChart'), {
+            type: 'line',
+            data: {
+              labels: hourlyLabels,
+              datasets: [{
+                label: 'Disconnections',
+                data: hourlyData,
+                borderColor: cssVar('--c-primary') || '#0066cc',
+                backgroundColor: (cssVar('--c-primary') || '#0066cc') + '20',
+                tension: 0.3,
+                fill: true,
+              }],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              plugins: { legend: { display: false } },
+              scales: {
+                y: { beginAtZero: true, ticks: { precision: 0 } },
+              },
+            },
+          });
+        }
+
+        // Render daily chart
+        const dailyLabels = data.daily_disconnects.map(d => {
+          const date = new Date(d.day);
+          return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        });
+        const dailyData = data.daily_disconnects.map(d => d.disconnect_count);
+
+        if (dailyChart) {
+          dailyChart.data.labels = dailyLabels;
+          dailyChart.data.datasets[0].data = dailyData;
+          dailyChart.update();
+        } else {
+          dailyChart = new Chart($('dailyDisconnectChart'), {
+            type: 'bar',
+            data: {
+              labels: dailyLabels,
+              datasets: [{
+                label: 'Disconnections',
+                data: dailyData,
+                backgroundColor: cssVar('--c-primary') || '#0066cc',
+              }],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              plugins: { legend: { display: false } },
+              scales: {
+                y: { beginAtZero: true, ticks: { precision: 0 } },
+              },
+            },
+          });
+        }
+      }
+
+      // Render top disconnected users
+      const tbody = clear($('topDisconnectedBody'));
+      const empty = $('topDisconnectedEmpty');
+
+      if (data.top_disconnected_users.length === 0) {
+        empty.hidden = false;
+      } else {
+        empty.hidden = true;
+        data.top_disconnected_users.forEach(user => {
+          tbody.append(h('tr', {},
+            h('td', { text: user.username }),
+            h('td', { text: fmtNum(user.disconnect_count) }),
+            h('td', { text: formatTime(user.last_disconnect) }),
+            h('td', { text: formatTime(user.last_connected) }),
+            h('td', {}, h('button', {
+              class: 'btn btn-sm',
+              text: 'View History',
+              onclick: () => showUserHistory(user.username),
+            }))
+          ));
+        });
+      }
+    } catch (e) {
+      toast('Failed to load PPPoE dashboard: ' + e.message, 'err');
+    }
+  }
+
+  const live = { pending: new Set(), sample: null, history: [], chart: null, destQuery: null };
+
+  function bandwidth(value) {
+    return value == null ? '—' : (value / 1000000).toFixed(2) + ' Mbps';
+  }
+
+  function trafficPair(rate) {
+    return rate ? rate.map(bandwidth).join(' / ') : '—';
+  }
+
+  function graphKey(row, queue) {
+    return JSON.stringify([row.id, row.name, row.ip, queue?.name ?? null]);
+  }
+
+  function renderGraph() {
+    if (!window.Chart) return;
+    const key = $('live-graph-source').value;
+    if (!live.chart) {
+      live.chart = new Chart($('live-bandwidth-chart'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+          { label: 'Upload (Mbps)', data: [], borderColor: '#dd850b', pointRadius: 0 },
+          { label: 'Download (Mbps)', data: [], borderColor: '#3287ee', pointRadius: 0 },
+        ] },
+        options: { maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true } } },
+      });
+    }
+    live.chart.data.labels = live.history.map(({ at }) =>
+      new Date(at).toLocaleTimeString([], { hour12: false }));
+    live.chart.data.datasets.forEach((dataset, direction) => {
+      dataset.data = live.history.map(({ rates }) => {
+        const value = rates.get(key)?.[direction];
+        return value == null ? null : value / 1000000;
+      });
+    });
+    live.chart.update('none');
+  }
+
+  function renderSessions(data) {
+    const search = $('live-sessions-search').value.trim().toLowerCase();
+    const table = clear($('live-sessions-body'));
+    const source = $('live-graph-source');
+    const selected = source.value;
+    source.replaceChildren(h('option', { value: '', text: 'All active interfaces' }));
+    const rates = new Map();
+    const total = [0, 0];
+    let measured = 0;
+    const rows = [...data.rows].sort((a, b) =>
+      (b.traffic?.reduce((u, d) => u + d, 0) ?? 0) - (a.traffic?.reduce((u, d) => u + d, 0) ?? 0));
+    const selectGraph = (key) => { source.value = key; renderGraph(); };
+    for (const row of rows) {
+      const key = graphKey(row);
+      rates.set(key, row.traffic);
+      if (row.traffic) {
+        measured++;
+        total[0] += row.traffic[0];
+        total[1] += row.traffic[1];
+      }
+      source.append(h('option', { value: key, text: row.name + ' · ' + row.ip }));
+      const queueCells = row.queues.map(queue => {
+        const queueKey = graphKey(row, queue);
+        rates.set(queueKey, queue.rate);
+        source.append(h('option', { value: queueKey, text: row.name + ' · Queue ' + queue.name }));
+        return h('div', {}, h('button', {
+          class: 'btn btn-sm', type: 'button', text: queue.name, onclick: () => selectGraph(queueKey),
+        }), ' ', trafficPair(queue.rate));
+      });
+      if (![row.name, row.ip, row.profile].some(value => String(value ?? '').toLowerCase().includes(search))) continue;
+      table.append(h('tr', {},
+        h('td', {}, h('button', { class: 'btn btn-sm', type: 'button', text: row.name, onclick: () => selectGraph(key) })),
+        h('td', { text: row.ip || '—' }), h('td', { text: row.profile || 'Unavailable' }),
+        h('td', { text: row.uptime || '—' }), h('td', { text: trafficPair(row.traffic) }),
+        h('td', {}, queueCells.length ? queueCells : '—')));
+    }
+    if (!table.children.length) table.append(h('tr', {}, h('td', { colspan: 6, text: 'No matching active sessions.' })));
+    source.value = rates.has(selected) ? selected : '';
+    if (live.history.at(-1)?.at !== data.sampled_at) {
+      rates.set('', measured ? total : null);
+      live.history.push({ at: data.sampled_at, rates });
+      if (live.history.length > 60) live.history.shift();
+    }
+    renderGraph();
+    return rows.length + ' active sessions · ' + measured + ' with interface rates';
+  }
+
+  function renderDestinations(data) {
+    for (const [id, rows] of [['top', data.top], ['destinations', data.rows]]) {
+      const body = clear($('live-' + id + '-body'));
+      for (const row of rows) {
+        const columns = [row.destination, row.asn || '—',
+          fmtNum(row.up) + ' B', fmtNum(row.down) + ' B', bandwidth(row.bps)];
+        if (id === 'destinations') columns.unshift(row.name, row.ip);
+        body.append(h('tr', {}, columns.map(text => h('td', { text }))));
+      }
+      if (!rows.length) body.append(h('tr', {}, h('td', {
+        colspan: id === 'top' ? 5 : 7, text: 'No traffic measured in this sample.',
+      })));
+    }
+    return 'Showing ' + data.rows.length + ' of ' + data.total + ' client/destination pairs · bytes since previous sample';
+  }
+
+  async function loadLive(mode) {
+    if (live.pending.has(mode) || document.hidden) return;
+    live.pending.add(mode);
+    const status = $('live-' + mode + '-status');
+    const search = $('live-' + mode + '-search');
+    const query = search.value;
+    if (!status.textContent) status.textContent = 'Reading router…';
+    try {
+      const params = mode === 'destinations' ? '?' + new URLSearchParams({ q: query }) : '';
+      const data = await api('/api/pppoe/live/' + mode + params);
+      if (state.view !== 'live-' + mode || (mode === 'destinations' && query !== search.value)) return;
+      if (mode === 'sessions') live.sample = data;
+      const detail = mode === 'sessions' ? renderSessions(data) : renderDestinations(data);
+      status.textContent = [detail, 'Updated ' + fmtTime(data.sampled_at),
+        ...(data.warming ? ['Collecting the next sample for rates'] : []), ...data.warnings].join(' · ');
+    } catch (e) {
+      status.textContent = 'Update failed · ' + e.message;
+    } finally {
+      live.pending.delete(mode);
+      if (mode === 'destinations' && query !== search.value && state.view === 'live-destinations') loadLive(mode);
+    }
+  }
+
+  let eventsRequest = 0;
+  async function loadPPPoEEvents(quiet = false) {
+    const sequence = ++eventsRequest;
+    const loading = $('pppoeEventsLoading');
+    const empty = $('pppoeEventsEmpty');
+    const tbody = $('pppoeEventsBody');
+
+    if (!quiet) loading.hidden = false;
+
+    try {
+      const username = $('pppoe-search')?.value.trim() || '';
+      const eventType = $('pppoe-event-filter')?.value || '';
+
+      const params = new URLSearchParams();
+      params.append('limit', '100');
+      if (username) params.append('username', username);
+      if (eventType) params.append('event_type', eventType);
+
+      const data = await api('/api/pppoe/recent-events?' + params.toString());
+      if (sequence !== eventsRequest) return;
+      clear(tbody);
+      empty.hidden = true;
+      loading.hidden = true;
+
+      if (data.events.length === 0) {
+        empty.hidden = false;
+        empty.textContent = 'No events found.';
+      } else {
+        data.events.forEach(event => {
+          tbody.append(h('tr', {},
+            h('td', { text: formatTime(event.timestamp) }),
+            h('td', { text: event.username || '-' }),
+            h('td', {}, createEventBadge(event.event_type)),
+            h('td', { text: event.ip_address || '-' }),
+            h('td', { text: event.message, style: 'max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;', title: event.message })
+          ));
+        });
+      }
+    } catch (e) {
+      loading.hidden = true;
+      if (!quiet && sequence === eventsRequest) toast('Failed to load events: ' + e.message, 'err');
+    }
+  }
+
+  async function loadDisconnectedUsers() {
+    const loading = $('disconnectedUsersLoading');
+    const empty = $('disconnectedUsersEmpty');
+    const tbody = $('disconnectedUsersBody');
+
+    loading.hidden = false;
+    empty.hidden = true;
+    clear(tbody);
+
+    try {
+      const search = $('disconnected-search')?.value.trim() || '';
+      const days = $('disconnected-days-filter')?.value || '';
+
+      const params = new URLSearchParams();
+      params.append('limit', '100');
+      if (days) params.append('days', days);
+
+      const data = await api('/api/pppoe/most-disconnected?' + params.toString());
+
+      loading.hidden = true;
+
+      let users = data.users;
+
+      // Client-side search filter
+      if (search) {
+        users = users.filter(u => u.username.toLowerCase().includes(search.toLowerCase()));
+      }
+
+      if (users.length === 0) {
+        empty.hidden = false;
+        empty.textContent = search ? 'No users found matching your search.' : 'No disconnection data available.';
+      } else {
+        users.forEach(user => {
+          tbody.append(h('tr', {},
+            h('td', { text: user.username }),
+            h('td', { text: fmtNum(user.disconnect_count) }),
+            h('td', { text: formatTime(user.last_disconnect) }),
+            h('td', { text: formatTime(user.last_connected) }),
+            h('td', {}, h('button', {
+              class: 'btn btn-sm',
+              text: 'View History',
+              onclick: () => showUserHistory(user.username),
+            }))
+          ));
+        });
+      }
+    } catch (e) {
+      loading.hidden = true;
+      toast('Failed to load users: ' + e.message, 'err');
+    }
+  }
+
+  async function showUserHistory(username) {
+    state.currentUsername = username;
+    showView('pppoe-user-history');
+
+    try {
+      const data = await api(`/api/pppoe/user/${encodeURIComponent(username)}/history`);
+      const history = data.history;
+
+      $('historyUsername').textContent = `Connection History: ${username}`;
+      $('history-total-connected').textContent = fmtNum(history.total_connected);
+      $('history-total-disconnected').textContent = fmtNum(history.total_disconnected);
+      $('history-last-connected').textContent = formatTime(history.last_connected);
+      $('history-last-disconnected').textContent = formatTime(history.last_disconnected);
+
+      const tbody = clear($('historyEventsBody'));
+      const empty = $('historyEventsEmpty');
+
+      if (history.events.length === 0) {
+        empty.hidden = false;
+      } else {
+        empty.hidden = true;
+        history.events.forEach(event => {
+          tbody.append(h('tr', {},
+            h('td', { text: formatTime(event.timestamp) }),
+            h('td', {}, createEventBadge(event.event_type)),
+            h('td', { text: event.ip_address || '-' }),
+            h('td', { text: event.disconnect_reason || '-' }),
+            h('td', { text: event.message, style: 'max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;', title: event.message })
+          ));
+        });
+      }
+    } catch (e) {
+      if (e.status === 404) {
+        toast('No history found for this user.', 'err');
+      } else {
+        toast('Failed to load user history: ' + e.message, 'err');
+      }
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

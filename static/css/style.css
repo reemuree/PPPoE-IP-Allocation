@@ -339,3 +339,16 @@ input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--accent); c
   .search { max-width: none; }
 }
 @media print { .sidebar, .topbar, .toolbar, .pager, .toasts { display: none !important; } .app { display: block; } }
+
+.live-graph-card {
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.live-graph-box {
+  height: 240px;
+}
+
+.live-table {
+  margin-bottom: 1rem;
+}

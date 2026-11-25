@@ -28,6 +28,11 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import ip_analyzer as analyzer
 import router_client
 from router_client import RouterConfig, RouterError
+from pppoe_monitor import PPPoEMonitor
+from live_monitor import LiveMonitor
+
+live_sessions = LiveMonitor()
+live_destinations = LiveMonitor(destinations=True)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -229,12 +234,68 @@ class SnapshotStore:
 store = SnapshotStore()
 
 
+# =============================================================== PPPoE monitoring
+
+class PPPoEMonitorThread:
+    """Background thread that polls PPPoE logs every 10-15 seconds."""
+
+    def __init__(self, db_path_fn, interval: int = 12):
+        self.db_path_fn = db_path_fn
+        self.interval = interval
+        self.running = False
+        self.thread = None
+        self.monitor = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        log.info("PPPoE monitor thread started (polling every %d seconds)", self.interval)
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=5)
+
+    def _run(self):
+        """Background polling loop."""
+        while self.running:
+            try:
+                if self.monitor is None:
+                    self.monitor = PPPoEMonitor(str(self.db_path_fn()))
+
+                cfg = RouterConfig.from_env()
+                result = self.monitor.fetch_and_store_logs(cfg)
+
+                if result.get("new_events", 0) > 0:
+                    log.info("PPPoE monitor: collected %d new events", result["new_events"])
+
+            except RouterError as exc:
+                log.debug("PPPoE monitor: router error: %s", exc)
+            except Exception:
+                log.exception("PPPoE monitor: unexpected error")
+
+            # Sleep in small increments so we can stop quickly
+            for _ in range(self.interval * 10):
+                if not self.running:
+                    break
+                time.sleep(0.1)
+
+
+pppoe_monitor_thread = PPPoEMonitorThread(db_path)
+
+
 # =============================================================== app factory
 
 def create_app() -> Flask:
     app = Flask(__name__)
     init_db()
     seed_admin_from_env()
+
+    # Start PPPoE monitoring thread
+    pppoe_monitor_thread.start()
 
     key = os.environ.get("SECRET_KEY") or ""
     if not key:
@@ -646,6 +707,132 @@ def create_app() -> Flask:
         resp.headers["Content-Disposition"] = f'attachment; filename="ips-{scope}-{stamp}{stale}.csv"'
         resp.headers["X-Data-Stale"] = "0" if not stale else "1"
         return resp
+
+    # ---------------------------------------------------------- PPPoE Monitoring API
+    @app.get("/api/pppoe/live/<mode>")
+    @login_required
+    def api_pppoe_live(mode):
+        if mode not in ("sessions", "destinations"):
+            return api_error("Unknown monitoring view.", 404)
+        if mode == "destinations" and not router_client._env_bool("ENABLE_DESTINATION_MONITOR", False):
+            return api_error("Set ENABLE_DESTINATION_MONITOR=1 in .env and restart to enable destination monitoring.", 403)
+        monitor = live_destinations if mode == "destinations" else live_sessions
+        try:
+            data = monitor.read(RouterConfig.from_env())
+        except RouterError as exc:
+            return api_error(str(exc), 502)
+        if mode == "sessions":
+            return jsonify(data)
+        query = request.args.get("q", "").strip().casefold()
+        rows = [row for row in data["rows"] if not query or any(
+            query in str(row[field]).casefold() for field in ("name", "ip", "destination", "asn")
+        )]
+        totals = {}
+        for row in rows:
+            total = totals.setdefault(row["destination"], {
+                "destination": row["destination"], "asn": row["asn"], "up": 0, "down": 0, "bps": 0,
+            })
+            for field in ("up", "down", "bps"):
+                total[field] += row[field]
+        return jsonify({**data, "rows": rows[:250], "total": len(rows),
+                        "top": sorted(totals.values(), key=lambda row: row["bps"], reverse=True)[:20]})
+
+    @app.get("/api/pppoe/dashboard")
+    @login_required
+    def api_pppoe_dashboard():
+        """Get PPPoE monitoring dashboard statistics."""
+        monitor = PPPoEMonitor(str(db_path()))
+        stats = monitor.get_dashboard_stats()
+        hourly_stats = monitor.get_hourly_disconnect_stats(days=1)
+        daily_stats = monitor.get_daily_disconnect_stats(days=30)
+
+        # Get top 10 disconnected users
+        top_users = monitor.get_most_disconnected_users(limit=10)
+
+        return jsonify({
+            "ok": True,
+            "stats": stats,
+            "hourly_disconnects": hourly_stats,
+            "daily_disconnects": daily_stats,
+            "top_disconnected_users": top_users,
+        })
+
+    @app.get("/api/pppoe/recent-events")
+    @login_required
+    def api_pppoe_recent_events():
+        """Get recent PPPoE connection events."""
+        try:
+            limit = min(500, max(1, int(request.args.get("limit", 100))))
+            offset = max(0, int(request.args.get("offset", 0)))
+        except ValueError:
+            return api_error("limit and offset must be integers.", 400)
+
+        username = request.args.get("username", "").strip() or None
+        event_type = request.args.get("event_type", "").strip() or None
+
+        if event_type and event_type not in ("connected", "disconnected", "unknown"):
+            return api_error("event_type must be connected, disconnected, or unknown.", 400)
+
+        monitor = PPPoEMonitor(str(db_path()))
+        events = monitor.get_recent_events(
+            limit=limit,
+            offset=offset,
+            username=username,
+            event_type=event_type
+        )
+
+        return jsonify({
+            "ok": True,
+            "events": events,
+            "limit": limit,
+            "offset": offset,
+        })
+
+    @app.get("/api/pppoe/most-disconnected")
+    @login_required
+    def api_pppoe_most_disconnected():
+        """Get users with the most disconnections."""
+        try:
+            limit = min(500, max(1, int(request.args.get("limit", 100))))
+        except ValueError:
+            return api_error("limit must be an integer.", 400)
+
+        days = request.args.get("days", "").strip()
+        days_int = None
+        if days:
+            try:
+                days_int = max(1, int(days))
+            except ValueError:
+                return api_error("days must be an integer.", 400)
+
+        monitor = PPPoEMonitor(str(db_path()))
+        users = monitor.get_most_disconnected_users(days=days_int, limit=limit)
+
+        return jsonify({
+            "ok": True,
+            "users": users,
+            "days": days_int,
+            "limit": limit,
+        })
+
+    @app.get("/api/pppoe/user/<path:username>/history")
+    @login_required
+    def api_pppoe_user_history(username: str):
+        """Get connection history for a specific user."""
+        username = username.strip()
+        if not username or len(username) > USERNAME_MAX:
+            return api_error("Invalid username.", 400)
+
+        monitor = PPPoEMonitor(str(db_path()))
+        history = monitor.get_user_connection_history(username)
+
+        if history["total_connected"] == 0 and history["total_disconnected"] == 0:
+            return api_error("No connection history found for this user.", 404)
+
+        return jsonify({
+            "ok": True,
+            "history": history,
+        })
 
     return app
 

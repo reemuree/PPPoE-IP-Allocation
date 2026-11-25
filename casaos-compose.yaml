@@ -1,0 +1,19 @@
+name: pppoe-ip-manager
+services:
+  pppoe-ip-manager:
+    image: pppoe-ip-manager:local
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "8088:5000"
+    volumes:
+      - /DATA/AppData/pppoe-ip-manager/.env:/app/.env:ro
+      - /DATA/AppData/pppoe-ip-manager/instance:/app/instance
+x-casaos:
+  main: pppoe-ip-manager
+  title:
+    en_us: PPPoE IP Manager
+  category: Network
+  scheme: http
+  port_map: "8088"
+  index: /

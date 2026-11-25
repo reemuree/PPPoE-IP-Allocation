@@ -1,0 +1,16 @@
+name: pppoe-ip-manager
+services:
+  pppoe-ip-manager:
+    image: pppoe-ip-manager:local
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8088:5000"
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./instance:/app/instance
