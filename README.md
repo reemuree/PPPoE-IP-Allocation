@@ -1,213 +1,82 @@
-# MikroTik PPPoE IP Allocation Manager
+# MikroTik PPPoE IP Manager
 
-<p align="center">
-  <b>A lightweight and professional IP allocation management dashboard for MikroTik ISP networks.</b>
-</p>
+A self-hosted dashboard for ISP operators who manage static PPPoE IP assignments and monitor MikroTik subscribers. It uses a read-only RouterOS API connection and runs on Docker, including CasaOS hosts.
 
-<p align="center">
-  Monitor PPPoE users, track static IP assignments, detect conflicts, and manage your IP address inventory from one centralized dashboard.
-</p>
+## Features
 
----
+| Feature | What you can see |
+| --- | --- |
+| IP allocation | Free, assigned and reserved IPs across selected CIDRs, duplicate assignments, out-of-range addresses and CSV export |
+| Active PPPoE sessions | Username, client IP, configured PPP profile, uptime and live upload/download rates |
+| Simple Queues | Bandwidth rates and live graphs for queues matched to individual clients |
+| Destination traffic | Top IPv4 destinations by measured traffic, per-client destination traffic and optional ASN organization lookup |
+| Connection logs | Connect/disconnect events, username and event filters, user history and most-disconnected subscribers |
 
-## 📌 Overview
+Built with Python, Flask, SQLite, Gunicorn and vanilla JavaScript. The dashboard stores application settings and collected PPPoE events in SQLite.
 
-**MikroTik PPPoE IP Allocation Manager** is a web-based dashboard developed for Internet Service Providers (ISPs) to simplify static IP allocation monitoring and management.
+## Quick start with Docker Compose
 
-The application connects to MikroTik RouterOS through its API and collects information from PPPoE secrets, active sessions, and routing tables.
+You need Docker with the Compose plugin and a RouterOS API account with `read,api` permissions. The Docker host must be able to reach the router's management address and API port.
 
-Instead of manually checking multiple RouterOS menus, administrators can view their IP allocation status, identify duplicate assignments, monitor available addresses, and manage their network inventory through a clean and responsive interface.
+From the project directory containing `Dockerfile` and `compose.yaml`:
 
-**The application uses read-only RouterOS API access and does not modify router configurations.**
-
-## ✨ Key Features
-
-- **Static IP Management** — Track static IP addresses assigned to PPPoE users.
-- **Automatic Conflict Detection** — Identify duplicate IP assignments and IP collisions involving active sessions.
-- **IP Pool Monitoring** — Expand administrator-selected CIDR blocks and monitor available IP addresses.
-- **Free & Assigned IP Tracking** — Get a clear overview of free, assigned, and reserved IP addresses.
-- **Live PPPoE Monitoring** — Compare active PPPoE sessions with configured PPP secrets.
-- **Read-Only Router Integration** — Retrieve network information without changing router configurations.
-- **Real-Time Dashboard** — Monitor network IP allocation statistics.
-- **Interactive Charts** — Visualize IP allocation using Doughnut charts.
-- **Searchable Inventory** — Search and sort IP allocation records.
-- **Quick Filters** — Filter IP addresses and allocation statuses from the sidebar.
-- **CSV Export** — Export IP inventory data for external analysis.
-- **Background Synchronization** — Automatically synchronize router data every 30 seconds.
-- **Responsive Interface** — Access the dashboard from desktop and mobile devices.
-
-## 🖥️ Dashboard Preview
-
-<!-- Add your dashboard screenshot here -->
-<!-- Example: ![Dashboard Preview](screenshots/dashboard.png) -->
-
-## 🛠️ Technology Stack
-
-| Component | Technology |
-|---|---|
-| Backend | Python 3 |
-| Web Framework | Flask |
-| Router API | librouteros |
-| Database | SQLite |
-| Frontend | HTML5, CSS3 |
-| JavaScript | Vanilla JavaScript (ES6+) |
-| Charts | Chart.js |
-| Data Export | CSV |
-
-**No JavaScript frameworks or Node.js required.**
-
-## 📋 Prerequisites
-
-Before installing, make sure you have:
-
-- Ubuntu Server 22.04 / 24.04 LTS or Windows
-- Python 3.8 or higher
-- MikroTik RouterOS v6 or v7
-- RouterOS API access enabled
-- A dedicated MikroTik API user with **read-only permissions**
-- Network connectivity between the application server and MikroTik router
-
-## 🚀 Installation Guide
-
-### 1. Install System Dependencies
-
-For Ubuntu Server:
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip git
+```sh
+cp -n .env.example .env
+mkdir -p instance
 ```
 
-### 2. Clone the Repository
+Edit `.env` before starting:
 
-```bash
-git clone YOUR_GITHUB_REPOSITORY_URL
-cd YOUR_PROJECT_FOLDER
+| Variable | Value |
+| --- | --- |
+| `ROUTER_HOST` | MikroTik management IP or hostname |
+| `ROUTER_USER` | Read-only RouterOS API username |
+| `ROUTER_PASSWORD` | RouterOS API password |
+| `ROUTER_PORT` | Your API service port. Defaults to 8728, or 8729 with API-SSL |
+| `ROUTER_USE_SSL` | Set to `true` to use API-SSL |
+| `ADMIN_USER` | Initial dashboard username. Defaults to `admin` |
+| `ADMIN_PASSWORD` | Initial dashboard password, at least 10 characters |
+
+```sh
+sudo chown 1000:1000 .env
+sudo chown -R 1000:1000 instance
+sudo chmod 600 .env
+sudo docker compose up -d --build
+sudo docker compose ps
 ```
 
-Replace the repository URL and folder name with your actual project details.
+Open `http://<server-LAN-IP>:8088` and sign in. For an existing installation, stop the old app and back up and copy its `.env` and `instance/` before starting the container. See [Docker deployment](DOCKER_DEPLOYMENT.md) if you use a custom SQLite path.
 
-### 3. Create a Python Virtual Environment
+## CasaOS
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
+Use the Docker Compose quick start on the CasaOS server. To install through the CasaOS dashboard, place the project at `/DATA/AppData/pppoe-ip-manager` and complete the file and permission setup above. Build the image on that server:
+
+```sh
+cd /DATA/AppData/pppoe-ip-manager
+sudo docker build -t pppoe-ip-manager:local .
 ```
 
-### 4. Install Python Dependencies
+In **App Store → Custom Install → Import**, paste [casaos-compose.yaml](casaos-compose.yaml). If the import fails, use Docker Compose on the same server and inspect its output. Both configurations publish port 8088.
 
-```bash
-pip install -r requirements.txt
+## Enable destination traffic and ASN names
+
+Set `ENABLE_DESTINATION_MONITOR=1` in `.env`. For ASN organization names, place a GeoLite2 ASN IPv4 Blocks CSV inside `instance/` and set:
+
+```dotenv
+ASN_CSV=/app/instance/GeoLite2-ASN-Blocks-IPv4.csv
 ```
 
-### 5. Configure MikroTik API Access
+Restart the app and open **Destination Traffic**. The view ranks IPv4 destinations by sampled traffic volume. Filter by username or client IP to see a subscriber's top destinations. IPs can be shared across websites, and FastTracked or short-lived connections can be undercounted. Queue rates are available for supported single-client Simple Queue targets. See [Live monitoring](LIVE_MONITORING.md) for collection details.
 
-Enable API access on your MikroTik router:
+## Troubleshooting
 
-```routeros
-/ip service enable api
+```sh
+sudo docker compose ps
+sudo docker compose logs --tail=100 pppoe-ip-manager
 ```
 
-Create a dedicated read-only user and assign it to a group with appropriate read permissions.
+- If CasaOS cannot find the image, check `sudo docker image inspect pppoe-ip-manager:local`.
+- If the dashboard loads but cannot sync, check the router address, API port, account permissions and reachability from the Docker host.
+- If SQLite reports a permission error, check UID/GID 1000 ownership on the mounted `instance/` directory.
+- When opening an issue, include the failing command, relevant error, and RouterOS and Docker versions. Remove credentials and subscriber data from logs before posting.
 
-Example:
-
-```routeros
-/user group add name=ip-manager-read policy=read,api
-/user add name=ipmanager group=ip-manager-read password=YOUR_STRONG_PASSWORD
-```
-
-For production environments, restrict API access to the application server's IP address using MikroTik firewall rules. Do not expose the API service publicly.
-
-### 6. Configure the Application
-
-Update the router connection settings according to your project's configuration method.
-
-You will need:
-
-- MikroTik Router IP address
-- API Port
-- API Username
-- API Password
-
-Keep credentials private. Never commit real router passwords or sensitive configuration files to GitHub.
-
-### 7. Run the Application
-
-Use your project's configured Flask entry point. For example:
-
-```bash
-python3 app.py
-```
-
-Open the dashboard in your browser using the address and port configured by the application.
-
-## 🔐 Security
-
-Security is important when managing ISP network infrastructure.
-
-- Use a dedicated RouterOS API account.
-- Grant only the permissions required for reading network information.
-- Restrict API access to trusted IP addresses.
-- Use strong passwords.
-- Keep router credentials out of source code and public repositories.
-- Use HTTPS when exposing the dashboard beyond a trusted local network.
-
-## 💾 Data & Synchronization
-
-The application uses SQLite for storing application settings.
-
-Router information is retrieved through the MikroTik API and synchronized in the background at 30-second intervals.
-
-The dashboard provides an updated view of IP allocation based on the collected router information.
-
-## 🎯 Designed For
-
-- Internet Service Providers (ISPs)
-- MikroTik Network Administrators
-- PPPoE Network Operators
-- Network Engineers
-- ISP Technical Support Teams
-
-## 🗺️ Future Improvements
-
-Possible future enhancements:
-
-- Multiple MikroTik router support
-- IP allocation history
-- Advanced IP conflict reports
-- User activity logs
-- IP reservation management
-- Advanced network analytics
-
-## ❤️ Support the Developer
-
-If this project helps you manage your ISP network, you can support its development through Chabondhu.
-
-<p align="center">
-  <a href="https://chabondhu.com/reemuree">
-    <img src="https://img.shields.io/badge/Support%20Development-Donate%20via%20Chabondhu-ff69b4?style=for-the-badge" alt="Donate via Chabondhu" />
-  </a>
-</p>
-
-<p align="center">
-  <a href="https://chabondhu.com/reemuree">Donate via Chabondhu</a>
-</p>
-
-Every contribution is appreciated and helps support future development. ❤️
-
-
-
-## 📄 License
-
-Specify your preferred open-source license in the repository. If no license file is included, all rights remain with the copyright holder by default.
-
----
-
-<p align="center">
-  Developed with ❤️ for MikroTik ISP Network Administrators.
-</p>
-
-<p align="center">
-  <b>MikroTik PPPoE IP Allocation Manager</b>
-</p>
