@@ -33,10 +33,14 @@ demand, typically every 4–6 seconds, and the graph retains up to 60 samples in
 ## Destination Traffic
 
 Set `ENABLE_DESTINATION_MONITOR=1` in `.env` and restart the app. Set
-`ASN_CSV` to the absolute path of a MaxMind GeoLite2 ASN IPv4 Blocks CSV to enable
-local ASN and organization lookups. The expected columns are
-`network,autonomous_system_number,autonomous_system_organization`.
-The CSV is obtained separately from MaxMind. No client destinations are sent to a lookup service.
+`ASN_MMDB` to a direct HTTPS GeoLite2 ASN MMDB URL or a local MMDB file path.
+The app streams online MMDB data to temporary storage and memory-maps it.
+The first visit starts the download in the background. While the page is used,
+a successful download is refreshed after one hour, and a failed download is
+retried after five minutes. A fixed release URL must be changed to use a newer
+release. Lookups run locally without sending destination IPs to the data provider.
+If `ASN_MMDB` is unset, `ASN_CSV` accepts a local path or HTTPS CSV URL.
+See [Docker deployment](DOCKER_DEPLOYMENT.md) for configuration examples.
 
 The page samples IPv4 connection tracking on demand about every 10 seconds. The
 first sample establishes a baseline. The next samples rank destination IPs by measured

@@ -31,8 +31,20 @@ For direct HTTP access, set `SESSION_COOKIE_SECURE=false` if that setting was pr
 for an HTTPS proxy.
 
 For destination monitoring, enable `ENABLE_DESTINATION_MONITOR=1` in `.env`.
-To resolve ASN names, put the IPv4 ASN CSV in `instance/` and set
-`ASN_CSV=/app/instance/GeoLite2-ASN-Blocks-IPv4.csv` (adjust the basename if different).
+Set `ASN_MMDB` to a direct HTTPS download link for GeoLite2 ASN:
+
+```dotenv
+ASN_MMDB="https://github.com/FyraLabs/geolite2/releases/download/1795745698/GeoLite2-ASN.mmdb"
+```
+
+The container needs outbound HTTPS access. On first use of Destination Traffic, the app
+streams the database to a temporary file and memory-maps it for local IP lookups.
+The app refreshes the database on demand after one hour and keeps the last usable
+database if a refresh fails. A fixed release URL stays on that release until you
+change it. No ASN file is required in the persistent data directory.
+
+You can also set `ASN_MMDB=/app/instance/GeoLite2-ASN.mmdb` for a local file.
+Existing `ASN_CSV` configuration still works when `ASN_MMDB` is unset.
 
 Give the non-root container user access to the application data before starting:
 

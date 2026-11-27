@@ -1,13 +1,22 @@
 """Shared, on-demand read-only monitoring samples."""
 import csv
+import io
 import ipaddress
 import os
+import tempfile
+import weakref
 import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from functools import lru_cache
+from http.client import HTTPException
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, build_opener
+
+import maxminddb
+from maxminddb.errors import InvalidDatabaseError
 
 import router_client as router
 
@@ -37,19 +46,149 @@ def address(value):
             return None
 
 
-@lru_cache(maxsize=2)
-def asn_index(path, modified):
+MAX_ASN_CSV_BYTES = 32 * 1024 * 1024
+ASN_FIELDS = ("network", "autonomous_system_number", "autonomous_system_organization")
+
+
+def parse_asn_csv(source):
     groups = defaultdict(dict)
-    with open(path, encoding="utf-8-sig", newline="") as source:
-        for row in csv.DictReader(source):
-            network = ipaddress.IPv4Network(row["network"])
-            groups[network.prefixlen][int(network.network_address)] = (
-                "AS" + row["autonomous_system_number"] + " " + row["autonomous_system_organization"]
-            )
+    reader = csv.DictReader(source, strict=True)
+    if not set(ASN_FIELDS).issubset(reader.fieldnames or ()):
+        raise ValueError("Unexpected ASN CSV columns")
+    for row in reader:
+        network = ipaddress.IPv4Network(row["network"])
+        number = row["autonomous_system_number"]
+        organization = row["autonomous_system_organization"]
+        if not number or not number.isdecimal() or organization is None:
+            raise ValueError("Invalid ASN CSV row")
+        groups[network.prefixlen][int(network.network_address)] = f"AS{number} {organization}".rstrip()
+    if not groups:
+        raise ValueError("Empty ASN CSV")
     return sorted(groups.items(), reverse=True)
 
 
+@lru_cache(maxsize=2)
+def asn_index(path, modified):
+    with open(path, encoding="utf-8-sig", newline="") as source:
+        return parse_asn_csv(source)
+
+
+class HTTPSRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme != "https":
+            raise ValueError("ASN downloads require HTTPS redirects")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_asn_index(url):
+    with build_opener(HTTPSRedirectHandler()).open(url, timeout=15) as response:
+        payload = response.read(MAX_ASN_CSV_BYTES + 1)
+    if len(payload) > MAX_ASN_CSV_BYTES:
+        raise ValueError("ASN CSV exceeds size limit")
+    return parse_asn_csv(io.StringIO(payload.decode("utf-8-sig"), newline=""))
+
+
+MAX_ASN_MMDB_BYTES = 64 * 1024 * 1024
+
+
+class MMDBLookup:
+    def __init__(self, path, directory=None):
+        reader = maxminddb.open_database(str(path), mode=maxminddb.MODE_MMAP)
+        try:
+            if reader.metadata().database_type not in ("GeoLite2-ASN", "GeoIP2-ASN"):
+                raise ValueError("Expected an ASN MMDB database")
+        except Exception:
+            reader.close()
+            raise
+        self.reader = reader
+        self.cleanup = weakref.finalize(self, self.close, reader, directory)
+
+    @staticmethod
+    def close(reader, directory):
+        try:
+            reader.close()
+        finally:
+            if directory is not None:
+                directory.cleanup()
+
+    def lookup(self, ip):
+        try:
+            record = self.reader.get(str(ipaddress.IPv4Address(ip))) or {}
+        except (InvalidDatabaseError, ValueError):
+            return ""
+        number = record.get("autonomous_system_number")
+        organization = record.get("autonomous_system_organization") or ""
+        return f"AS{number} {organization}".rstrip() if number is not None else organization
+
+
+@lru_cache(maxsize=1)
+def local_mmdb(path, modified):
+    return MMDBLookup(path)
+
+
+def download_mmdb(url):
+    directory = tempfile.TemporaryDirectory(prefix="pppoe-asn-")
+    path = Path(directory.name) / "asn.mmdb"
+    try:
+        total = 0
+        deadline = time.monotonic() + 120
+        opener = build_opener(HTTPSRedirectHandler())
+        with opener.open(url, timeout=15) as response, path.open("wb") as target:
+            while chunk := response.read(128 * 1024):
+                total += len(chunk)
+                if total > MAX_ASN_MMDB_BYTES or time.monotonic() > deadline:
+                    raise ValueError("ASN MMDB download exceeded the size or time limit")
+                target.write(chunk)
+            length = response.headers.get("Content-Length")
+            if length is not None and total != int(length):
+                raise ValueError("Incomplete ASN MMDB download")
+        return MMDBLookup(path, directory)
+    except Exception:
+        directory.cleanup()
+        raise
+
+
+class RemoteASN:
+    def __init__(self, url, mmdb=False):
+        self.url = url
+        self.mmdb = mmdb
+        self.lock = threading.Lock()
+        self.index = []
+        self.next_attempt = float("-inf")
+        self.loading = False
+        self.failed = False
+
+    def read(self, warnings):
+        with self.lock:
+            if not self.loading and time.monotonic() >= self.next_attempt:
+                self.loading = True
+                threading.Thread(target=self.refresh, daemon=True).start()
+            if self.failed:
+                warnings.append("ASN URL refresh failed. " + (
+                    "Showing the last successful ASN data." if self.index else "Check the ASN link and server internet access."
+                ))
+            elif self.loading and not self.index:
+                warnings.append("Downloading ASN database. Names will appear after it loads.")
+            return self.index
+
+    def refresh(self):
+        index = None
+        try:
+            index = download_mmdb(self.url) if self.mmdb else download_asn_index(self.url)
+        except (OSError, ValueError, csv.Error, HTTPException, InvalidDatabaseError):
+            pass
+        finally:
+            with self.lock:
+                self.failed = index is None
+                if index is not None:
+                    self.index = index
+                self.loading = False
+                self.next_attempt = time.monotonic() + (300 if self.failed else 3600)
+
+
 def asn_name(ip, index):
+    if isinstance(index, MMDBLookup):
+        return index.lookup(ip)
     for prefix, entries in index:
         match = entries.get((ip >> (32 - prefix)) << (32 - prefix))
         if match:
@@ -60,6 +199,7 @@ def asn_name(ip, index):
 class LiveMonitor:
     def __init__(self, destinations=False):
         self.destinations = destinations
+        self.remote_asn = None
         self.interval = 10 if destinations else 4
         self.lock = threading.Lock()
         self.last_attempt = float("-inf")
@@ -204,18 +344,33 @@ class LiveMonitor:
 
         if fasttrack:
             warnings.append("FastTracked traffic may be undercounted.")
-        index = []
-        configured = os.environ.get("ASN_CSV")
-        if configured:
-            try:
-                path = Path(configured)
-                index = asn_index(str(path), path.stat().st_mtime_ns)
-            except (OSError, KeyError, ValueError):
-                warnings.append("ASN CSV could not be loaded.")
-        else:
-            warnings.append("Set ASN_CSV to show destination ASN and organization.")
+        index = self.read_asn(warnings)
         return [{"name": name, "ip": source, "destination": str(ipaddress.IPv4Address(dest)),
                  "asn": asn_name(dest, index), "up": up, "down": down,
                  "bps": round((up + down) * 8 / elapsed)}
                 for (name, source, dest), (up, down) in sorted(
                     paths.items(), key=lambda item: sum(item[1]), reverse=True)]
+
+
+    def read_asn(self, warnings):
+        mmdb = os.environ.get("ASN_MMDB", "").strip()
+        configured = mmdb or os.environ.get("ASN_CSV", "").strip()
+        if not configured:
+            warnings.append("Set ASN_MMDB or ASN_CSV to show destination ASN and organization.")
+            return []
+        try:
+            if "://" in configured:
+                url = urlsplit(configured)
+                if url.scheme != "https" or not url.hostname or url.username or url.password:
+                    warnings.append("ASN URL must use HTTPS without embedded credentials.")
+                    return []
+                if (self.remote_asn is None or self.remote_asn.url != configured
+                        or self.remote_asn.mmdb != bool(mmdb)):
+                    self.remote_asn = RemoteASN(configured, mmdb=bool(mmdb))
+                return self.remote_asn.read(warnings)
+            path = Path(configured)
+            load = local_mmdb if mmdb else asn_index
+            return load(str(path), path.stat().st_mtime_ns)
+        except (OSError, ValueError, csv.Error, InvalidDatabaseError):
+            warnings.append("ASN database could not be loaded.")
+            return []
